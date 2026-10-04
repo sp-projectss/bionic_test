@@ -81,16 +81,9 @@ static const PrefixEntry kFrameworkDirs[] = {
     { nullptr, 0 }
 };
 
-static const PrefixEntry kOverlayDirs[] = {
-    PE("/system/overlay"),
-    PE("/system_ext/overlay"),
-    PE("/product/overlay"),
-    PE("/vendor/overlay"),
-    PE("/odm/overlay"),
-    { nullptr, 0 }
-};
-
 static const PrefixEntry kRomArtifactPrefixes[] = {
+    PE("org.evolution."),
+    PE("org.lunaris."),
     PE("org.lineageos."),
     PE("org.libremobileos."),
     PE("com.crdroid."),
@@ -105,8 +98,8 @@ static const PrefixEntry kRomArtifactPrefixes[] = {
 };
 
 static const PrefixEntry kProcFilterKeywords[] = {
-    PE("lineage"), PE("Lineage"), PE("crdroid"), PE("crDroid"),
-    PE("omnirom"), PE("aospa"),
+    PE("lineage"), PE("Lineage"), PE("evolution"), PE("Evolution"), PE("crdroid"),
+    PE("omnirom"), PE("aospa"), PE("CrDroid"),
     { nullptr, 0 }
 };
 
@@ -234,63 +227,38 @@ static inline int raw_statfs(const char* path, struct statfs* sf) {
 #endif
 }
 
-static bool read_cmdline_name(char* out, size_t out_size) {
-    if (out_size == 0) return false;
+static bool compute_allowlisted() {
     int fd = raw_openat("/proc/self/cmdline", O_RDONLY);
     if (fd < 0) return false;
 
-    ssize_t n = raw_read(fd, out, out_size - 1);
+    char cmdline[256];
+    ssize_t n = raw_read(fd, cmdline, sizeof(cmdline) - 1);
     raw_close(fd);
     if (n <= 0) return false;
 
-    out[n] = '\0';
-    if (char* colon = strchr(out, ':')) *colon = '\0';
-    return true;
-}
-
-static bool name_is_zygote(const char* name) {
-    size_t len = strlen(name);
-    static const char kZygoteSuffix[] = "_zygote";
-    size_t slen = sizeof(kZygoteSuffix) - 1;
-    if (len >= slen && strcmp(name + len - slen, kZygoteSuffix) == 0) return true;
-    if (strcmp(name, "zygote") == 0 || strcmp(name, "zygote64") == 0) return true;
-    if (strcmp(name, "usap32") == 0 || strcmp(name, "usap64") == 0) return true;
-    return false;
-}
-
-static bool compute_exempt(bool* is_zygote) {
-    *is_zygote = false;
-
-    char name[256];
-    if (!read_cmdline_name(name, sizeof(name))) return false;
-
-    if (name_is_zygote(name)) { *is_zygote = true; return true; }
+    cmdline[n] = '\0';
+    if (char* colon = strchr(cmdline, ':')) *colon = '\0';
 
     for (const char* const* p = kAllowlistedPackages; *p; ++p) {
-        if (strcmp(name, *p) == 0) return true;
+        if (strcmp(cmdline, *p) == 0) return true;
     }
     return false;
 }
 
-static bool is_exempt_process() {
+static bool is_allowlisted_process() {
     static pid_t cached_pid = -1;
     static bool cached_value = false;
     pid_t cur = getpid();
     if (cur == cached_pid) return cached_value;
-
-    bool is_zygote = false;
-    bool result = compute_exempt(&is_zygote);
-
-    if (!is_zygote) {
-        cached_value = result;
-        cached_pid = cur;
-    }
+    bool result = compute_allowlisted();
+    cached_value = result;
+    cached_pid = cur;
     return result;
 }
 
 static bool is_app_process() {
     if ((getuid() % AID_USER_OFFSET) < AID_APP_START) return false;
-    if (is_exempt_process()) return false;
+    if (is_allowlisted_process()) return false;
     return true;
 }
 
@@ -382,20 +350,6 @@ static bool is_rom_framework_artifact(const char* path) {
     return basename_is_rom_artifact(slash ? slash + 1 : rest);
 }
 
-static bool is_rom_overlay(const char* path) {
-    const char* rest = nullptr;
-    for (const PrefixEntry* d = kOverlayDirs; d->str; ++d) {
-        if (strncmp(path, d->str, d->len) == 0 && path[d->len] == '/') {
-            rest = path + d->len + 1;
-            break;
-        }
-    }
-    if (!rest) return false;
-    const char* slash = strrchr(rest, '/');
-    const char* base = slash ? slash + 1 : rest;
-    return basename_is_rom_artifact(base) || name_has_rom_keyword(base);
-}
-
 static bool is_blocked_dir(const char* path) {
     const char* base = path_basename(path);
 
@@ -428,7 +382,6 @@ static bool is_rom_path(const char* path) {
 
     if (is_blocked_dir(clean)) return true;
     if (is_rom_framework_artifact(clean)) return true;
-    if (is_rom_overlay(clean)) return true;
     return false;
 }
 
@@ -469,7 +422,6 @@ bool custom_rom_hide_should_block_at(int dirfd, const char* path) {
                 if (strcmp(base, *dn) == 0) { candidate = true; break; }
             }
             if (!candidate && basename_is_rom_artifact(base)) candidate = true;
-            if (!candidate && name_has_rom_keyword(base)) candidate = true;
         }
         if (candidate) {
             char dir_path[256];
@@ -615,7 +567,6 @@ static bool line_has_blocked_segment(const char* line) {
     if (!path) return false;
 
     if (is_rom_framework_artifact(path)) return true;
-    if (is_rom_overlay(path)) return true;
 
     for (const PrefixEntry* kw = kProcFilterKeywords; kw->str; ++kw) {
         const char* p = path;
@@ -837,6 +788,7 @@ static bool drop_sepolicy_line(const char* line, void*) {
 }
 
 int custom_rom_hide_filter_sepolicy(const char* path) {
+    if (!path) return -1;
     if (!is_app_process()) return -1;
     if (!path || reinterpret_cast<uintptr_t>(path) < 0x1000000) return -1;
 
@@ -864,7 +816,7 @@ static const char* const kVintfFilterPaths[] = {
 };
 
 static const char* const kVintfFilterKeywords[] = {
-    "lineage", "Lineage", "crdroid", "crDroid", nullptr
+    "lineage", "Lineage", "evolution", "Evolution", nullptr
 };
 #endif
 
@@ -915,7 +867,8 @@ int custom_rom_hide_filter_vintf(const char* path) {
 }
 
 static const char* const kSpoofedEmptyProps[] = {
-    "ro.crdroid.version", "ro.lineage.version", "ro.lineage.build.version", "ro.cm.build.version",
+    "ro.evolution.version", "ro.evolution.build.version", "ro.evolution.display.version",
+    "ro.lineage.version", "ro.lineage.build.version", "ro.cm.build.version",
     "ro.modversion", "init.svc_debug_pid.adb_root",
     "init.svc.adb_root", "service.adb.root", nullptr
 };
